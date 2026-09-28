@@ -1,0 +1,414 @@
+"""Fetch Trustpilot review pages with a stealth browser and parse the embedded __NEXT_DATA__ JSON.
+
+Trustpilot is a Next.js site: every review page carries a <script id="__NEXT_DATA__"> blob with the
+same structured data the page renders. Reading that blob is far more stable than CSS selectors.
+The site sits behind a CloudFront JS challenge that blocks plain HTTP clients (curl, httpx, even
+TLS-impersonating ones), so a real headless browser via Scrapling is required.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Callable
+from urllib.parse import urlencode
+
+from .config import settings
+
+log = logging.getLogger(__name__)
+
+BASE = "https://www.trustpilot.com/review/"
+PER_PAGE = 20
+# Fetches per page before giving up. Named rather than inlined because scrape() has to price a
+# page before committing to it, and a cost estimate that drifts from the real retry count would
+# silently break the time budget.
+ATTEMPTS = 2
+NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', re.S)
+
+# Trustpilot only offers these fixed date windows. A requested month count maps to the smallest
+# window that covers it; anything larger than 12 means "all time".
+DATE_WINDOWS = [(1, "last30days"), (3, "last3months"), (6, "last6months"), (12, "last12months")]
+
+
+class TrustpilotError(Exception):
+    """Base class. `status` is the HTTP status the API should answer with."""
+
+    status = 502
+
+
+class NoTrustpilotPage(TrustpilotError):
+    """Brand has no Trustpilot profile. The API answers this with `200 []`, the empty dataset Apify
+    returned for the same domains, so the caller reads `no_results` and spends no retry on a page that
+    no retry can produce. The message keeps '404' / 'not found' for the CLI and the logs."""
+
+    status = 404
+
+
+class ScrapeBlocked(TrustpilotError):
+    """We were challenged or served a non-review page. This is OUR problem (vendor failure in the caller's
+    terms), so the message must NOT contain '404', 'not found', 'no such page' or 'invalid url'."""
+
+    status = 503
+
+
+class ScrapeFailed(TrustpilotError):
+    """Browser or network failure. Also a vendor failure from the caller's point of view."""
+
+    status = 503
+
+
+@dataclass
+class BusinessUnit:
+    display_name: str = ""
+    identifying_name: str = ""
+    trust_score: float | None = None
+    stars: float | None = None
+    number_of_reviews: int | None = None
+    number_of_reviews_last_12_months: int | None = None
+    website_url: str = ""
+    country_code: str = ""
+    is_closed: bool = False
+    is_claimed: bool = False
+
+
+@dataclass
+class Review:
+    id: str
+    rating: int
+    title: str
+    text: str
+    language: str
+    published_date: str
+    experienced_date: str
+    updated_date: str
+    consumer_name: str
+    consumer_country: str
+    consumer_review_count: int
+    verified: bool
+    verification_source: str
+    likes: int
+    reply_message: str
+    reply_date: str
+
+
+@dataclass
+class PageData:
+    reviews: list[Review]
+    business_unit: BusinessUnit
+    current_page: int
+    total_pages: int
+    total_count: int
+    selected_filters: dict
+
+
+@dataclass
+class ScrapeResult:
+    domain: str
+    reviews: list[Review]
+    business_unit: BusinessUnit
+    pages_fetched: int
+    total_pages: int
+    total_count: int
+    seconds: float
+    url: str
+    selected_filters: dict = field(default_factory=dict)
+    # True when the time budget stopped us before MAX_PAGES or the date window did. The reviews
+    # are real either way, so this is the only thing separating "that is all there was" from
+    # "we ran out of time" - both return 200.
+    truncated: bool = False
+
+
+# --------------------------------------------------------------------------- URL
+
+
+def clean_domain(raw: str) -> str:
+    d = raw.strip().lower()
+    d = re.sub(r"^https?://", "", d)
+    d = re.sub(r"^www\.", "", d)
+    d = d.split("/")[0].split("?")[0]
+    if not d or "." not in d:
+        raise ValueError(f"invalid domain: {raw!r}")
+    return d
+
+
+def date_window(months: int | None) -> str | None:
+    if months is None or months <= 0:
+        return None
+    for limit, key in DATE_WINDOWS:
+        if months <= limit:
+            return key
+    return None
+
+
+def build_url(domain: str, stars: list[int], months: int | None, page: int = 1, languages: str = "en") -> str:
+    params: list[tuple[str, str]] = [("stars", str(s)) for s in sorted(set(stars))]
+    params.append(("sort", "recency"))
+    params.append(("languages", languages))
+    window = date_window(months)
+    if window:
+        params.append(("date", window))
+    if page > 1:
+        params.append(("page", str(page)))
+    return BASE + domain + "?" + urlencode(params)
+
+
+# --------------------------------------------------------------------------- parsing
+
+
+def extract_next_data(html: str) -> dict | None:
+    m = NEXT_DATA_RE.search(html)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+
+
+def _s(v) -> str:
+    return "" if v is None else str(v)
+
+
+def parse_business_unit(pp: dict) -> BusinessUnit:
+    bu = pp.get("businessUnit") or {}
+    return BusinessUnit(
+        display_name=_s(bu.get("displayName")),
+        identifying_name=_s(bu.get("identifyingName")),
+        trust_score=bu.get("trustScore"),
+        stars=bu.get("stars"),
+        number_of_reviews=bu.get("numberOfReviews"),
+        number_of_reviews_last_12_months=bu.get("numberOfReviewsLast12Months"),
+        website_url=_s(bu.get("websiteUrl")),
+        country_code=_s(bu.get("countryCode")),
+        is_closed=bool(bu.get("isClosed")),
+        is_claimed=bool(bu.get("isClaimed")),
+    )
+
+
+def parse_review(r: dict) -> Review:
+    dates = r.get("dates") or {}
+    consumer = r.get("consumer") or {}
+    reply = r.get("reply") or {}
+    verification = (r.get("labels") or {}).get("verification") or {}
+    return Review(
+        id=_s(r.get("id")),
+        rating=int(r.get("rating") or 0),
+        title=_s(r.get("title")).strip(),
+        text=_s(r.get("text")).strip(),
+        language=_s(r.get("language")),
+        published_date=_s(dates.get("publishedDate")),
+        experienced_date=_s(dates.get("experiencedDate")),
+        updated_date=_s(dates.get("updatedDate")),
+        consumer_name=_s(consumer.get("displayName")),
+        consumer_country=_s(consumer.get("countryCode")),
+        consumer_review_count=int(consumer.get("numberOfReviews") or 0),
+        verified=bool(verification.get("isVerified")),
+        verification_source=_s(verification.get("verificationSource")),
+        likes=int(r.get("likes") or 0),
+        reply_message=_s(reply.get("message")),
+        reply_date=_s(reply.get("publishedDate")),
+    )
+
+
+def parse_page(next_data: dict) -> PageData:
+    pp = (next_data.get("props") or {}).get("pageProps") or {}
+    filters = pp.get("filters") or {}
+    pagination = filters.get("pagination") or {}
+    return PageData(
+        reviews=[parse_review(r) for r in (pp.get("reviews") or [])],
+        business_unit=parse_business_unit(pp),
+        current_page=int(pagination.get("currentPage") or 1),
+        total_pages=int(pagination.get("totalPages") or 1),
+        total_count=int(pagination.get("totalCount") or 0),
+        selected_filters=filters.get("selected") or {},
+    )
+
+
+# --------------------------------------------------------------------------- fetching
+
+
+def _html_of(page) -> str:
+    for attr in ("html_content", "body", "text"):
+        v = getattr(page, attr, None)
+        if v:
+            return v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v)
+    return ""
+
+
+def fetch_html(url: str) -> tuple[int, str]:
+    """One stealth-browser fetch. Returns (status, html). Raises ScrapeFailed on browser/network errors."""
+    from scrapling.fetchers import StealthyFetcher
+
+    try:
+        page = StealthyFetcher.fetch(
+            url,
+            headless=True,
+            # Load-bearing: the CloudFront JS challenge only clears if the browser is given time to
+            # run the page's JS. Measured 2026-09-16 and again 2026-09-19 from the host: returning
+            # straight after `load` gives HTTP 403 in ~1.2s on every page. Until 2026-09-19 that time
+            # came from network_idle=True, which was the wrong wait: Trustpilot keeps background
+            # requests open, so Scrapling's networkidle wait timed out (silently, at FETCH_TIMEOUT_MS)
+            # on 49 of 78 fetches in one harness run, each holding a page whose __NEXT_DATA__ had
+            # been in hand for 25s. Measured on the same four pages: network_idle 31.4/31.5/31.6s
+            # (404 page 31.3s); this selector wait 4.7/5.0/5.0s (404 page 3.6s), all with the blob
+            # present. The selector is the thing we parse, so the fetch returns the moment it exists
+            # and a challenge page, which lacks it, keeps the browser waiting until the real document
+            # lands. FETCH_TIMEOUT_MS is now only the ceiling for a page that never yields it.
+            network_idle=False,
+            wait_selector="script#__NEXT_DATA__",
+            wait_selector_state="attached",
+            disable_resources=settings.block_resources,
+            solve_cloudflare=settings.solve_cloudflare,
+            block_webrtc=True,
+            # Not redundant, and not safe to drop: Scrapling's own default is retries=3, and it
+            # multiplies with fetch_page's attempts and the page loop above it - 3 x 2 x 3 = 18
+            # navigations for one HTTP request, ~560s worst case. One retry lives in fetch_page,
+            # where it can tell a challenge from a dead browser; this layer just repeats blindly.
+            retries=1,
+            proxy=settings.proxy,
+            timeout=settings.fetch_timeout_ms,
+        )
+        # Removed 2026-09-17: humanize / os_randomize / geoip. They are Camoufox-era (scrapling
+        # 0.2.x) arguments that do not exist in 0.4.15 - the msgspec validator absorbs unknown
+        # keys silently, so they read as active stealth while doing nothing at all. If Trustpilot
+        # starts challenging this host, do not rule these out; they were never on.
+    except Exception as e:  # noqa: BLE001 - anything from the browser stack is a vendor failure
+        raise ScrapeFailed(f"browser fetch failed: {type(e).__name__}: {e}"[:300]) from e
+    return int(page.status), _html_of(page)
+
+
+def _title_of(html: str) -> str:
+    m = re.search(r"<title>(.*?)</title>", html, re.S)
+    return re.sub(r"\s+", " ", m.group(1)).strip()[:120] if m else ""
+
+
+def fetch_page(url: str, fetcher: Callable[[str], tuple[int, str]] = fetch_html, attempts: int = ATTEMPTS) -> PageData:
+    """Fetch and parse one review page, retrying once on a challenge, a non-200 or a dead browser
+    (but never on 404)."""
+    last_err: TrustpilotError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            status, html = fetcher(url)
+        except ScrapeFailed as e:
+            # The browser itself died. This used to escape the loop uncaught, which was survivable
+            # only because Scrapling was silently retrying three times underneath us. Now that we
+            # pass retries=1, this is the only crash retry left in the stack - deleting it means a
+            # single flaky Chromium launch becomes a 503.
+            last_err = e
+        else:
+            if status == 404:
+                raise NoTrustpilotPage(f"404 not found: no Trustpilot page at {url}")
+            if status != 200:
+                last_err = ScrapeBlocked(
+                    f"trustpilot answered HTTP {status} (bot challenge or rate limit), title={_title_of(html)!r}"
+                )
+            else:
+                data = extract_next_data(html)
+                if data is None:
+                    last_err = ScrapeBlocked(
+                        f"trustpilot served a page without __NEXT_DATA__ (challenge interstitial?), title={_title_of(html)!r}"
+                    )
+                else:
+                    return parse_page(data)
+        log.warning("attempt %d/%d failed for %s: %s", attempt, attempts, url, last_err)
+        if attempt < attempts:
+            time.sleep(settings.page_delay_s)
+    assert last_err is not None
+    raise last_err
+
+
+def scrape(
+    domain: str,
+    stars: list[int],
+    max_reviews: int = PER_PAGE,
+    months: int | None = 12,
+    fetcher: Callable[[str], tuple[int, str]] = fetch_html,
+) -> ScrapeResult:
+    """Collect up to `max_reviews` most-recent reviews in the given star band, newest first."""
+    domain = clean_domain(domain)
+    stars = [int(s) for s in stars if 1 <= int(s) <= 5] or [1, 2, 3, 4, 5]
+    max_reviews = max(1, int(max_reviews))
+    started = time.time()
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30 * months) if months and months > 0 else None
+
+    seen: set[str] = set()
+    reviews: list[Review] = []
+    bu = BusinessUnit()
+    total_pages = 1
+    total_count = 0
+    selected: dict = {}
+    page_no = 0
+    first_url = build_url(domain, stars, months, 1)
+    stop = False
+    truncated = False
+
+    # Worst case for one more page, and the wall-clock line we will not cross. We test whether
+    # there is room for a whole page rather than whether time is already up: a page started just
+    # under the deadline would otherwise overrun it by its entire cost. Page 1 is never skipped -
+    # returning zero reviews would be worse than returning late.
+    deadline = started + settings.scrape_budget_s
+    page_cost_s = ATTEMPTS * (settings.fetch_timeout_ms / 1000) + settings.page_delay_s
+
+    while not stop:
+        page_no += 1
+        url = first_url if page_no == 1 else build_url(domain, stars, months, page_no)
+        if page_no > 1:
+            if time.time() + page_cost_s > deadline:
+                truncated = True
+                page_no -= 1  # this page was priced, not fetched
+                log.info(
+                    "%s budget exhausted after %d page(s), returning %d review(s) early",
+                    domain, page_no, len(reviews),
+                )
+                break
+            time.sleep(settings.page_delay_s)
+        data = fetch_page(url, fetcher=fetcher)
+
+        if page_no == 1:
+            bu = data.business_unit
+            total_pages = data.total_pages
+            total_count = data.total_count
+            selected = data.selected_filters
+            if bu.is_closed:
+                log.info("%s is marked closed on Trustpilot", domain)
+
+        for r in data.reviews:
+            if r.rating not in stars:
+                continue  # belt and braces: the server-side filter has always held so far
+            if cutoff and r.published_date:
+                try:
+                    published = datetime.fromisoformat(r.published_date.replace("Z", "+00:00"))
+                    if published < cutoff:
+                        stop = True  # sorted by recency, so nothing after this is newer
+                        break
+                except ValueError:
+                    pass
+            key = r.id or f"{r.consumer_name}|{r.title}|{r.published_date}"
+            if key in seen:
+                continue
+            seen.add(key)
+            reviews.append(r)
+            if len(reviews) >= max_reviews:
+                stop = True
+                break
+
+        if not data.reviews or page_no >= total_pages or page_no >= settings.max_pages:
+            stop = True
+
+    return ScrapeResult(
+        domain=domain,
+        reviews=reviews[:max_reviews],
+        business_unit=bu,
+        pages_fetched=page_no,
+        total_pages=total_pages,
+        total_count=total_count,
+        seconds=round(time.time() - started, 1),
+        url=first_url,
+        selected_filters=selected,
+        truncated=truncated,
+    )
